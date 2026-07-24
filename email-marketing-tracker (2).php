@@ -720,10 +720,16 @@ class Email_Marketing_Tracker_643272e1 {
         if (!$template) return array('sent' => 0, 'errors' => 0);
 
         $where = $this->build_campaign_where_clause($campaign);
+        // Hard duplicate protection: never re-send to a lead who already
+        // received this exact campaign, no matter what the offset math says.
+        $where .= $wpdb->prepare(
+            " AND lead_id NOT IN (SELECT lead_id FROM {$this->events_table} WHERE campaign_id = %d AND event_type = 'Email Sent')",
+            $campaign_id
+        );
 
         $limit_sql = "";
         if ($limit > 0) {
-            $limit_sql = $wpdb->prepare(" LIMIT %d OFFSET %d", $limit, $offset);
+            $limit_sql = $wpdb->prepare(" LIMIT %d", $limit);
         }
 
         $leads = $wpdb->get_results("SELECT * FROM {$this->leads_table} {$where} ORDER BY id ASC {$limit_sql}");
@@ -1438,6 +1444,7 @@ class Email_Marketing_Tracker_643272e1 {
         $filter_status_now = isset($_GET['filter_status_now']) ? sanitize_text_field($_GET['filter_status_now']) : '';
         $filter_batch = isset($_GET['filter_batch']) ? sanitize_text_field($_GET['filter_batch']) : '';
         $filter_segment = isset($_GET['filter_segment']) && is_array($_GET['filter_segment']) ? array_map('sanitize_text_field', $_GET['filter_segment']) : array();
+        $filter_custom_tag = isset($_GET['filter_custom_tag']) && is_array($_GET['filter_custom_tag']) ? array_map('sanitize_text_field', $_GET['filter_custom_tag']) : array();
 
         $query = "SELECT * FROM {$this->leads_table} WHERE 1=1";
         if (!empty($search)) {
@@ -1486,6 +1493,13 @@ class Email_Marketing_Tracker_643272e1 {
                 $segment_clauses[] = $wpdb->prepare("segment_tags LIKE %s", '%' . $seg_val . '%');
             }
             $query .= " AND (" . implode(' OR ', $segment_clauses) . ")";
+        }
+        if (!empty($filter_custom_tag)) {
+            $custom_clauses = array();
+            foreach ($filter_custom_tag as $ct_val) {
+                $custom_clauses[] = $wpdb->prepare("custom_tags LIKE %s", '%' . $ct_val . '%');
+            }
+            $query .= " AND (" . implode(' OR ', $custom_clauses) . ")";
         }
         $query .= " ORDER BY id DESC";
         $leads = $wpdb->get_results($query);
@@ -1720,6 +1734,26 @@ class Email_Marketing_Tracker_643272e1 {
                                     <label class="emt-badge emt-badge-info" style="cursor:pointer; gap:4px;">
                                         <input type="checkbox" name="filter_segment[]" value="<?php echo esc_attr($seg_opt); ?>" <?php checked(in_array($seg_opt, $filter_segment)); ?> style="margin:0;" />
                                         <?php echo esc_html($seg_opt); ?>
+                                    </label>
+                                <?php endforeach; ?>
+                                <input type="submit" class="button button-small" value="<?php esc_attr_e('Apply', 'angie-snippets'); ?>" />
+                                <a href="<?php echo esc_url(admin_url('admin.php?page=emt-leads&tab=all-leads')); ?>" class="button button-small"><?php esc_html_e('Reset', 'angie-snippets'); ?></a>
+                            <?php endif; ?>
+                        </form>
+
+                        <div style="width: 100%; border-top: 1px solid #ccd0d4; margin: 10px 0;"></div>
+
+                        <form method="get" action="" style="width: 100%; display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+                            <input type="hidden" name="page" value="emt-leads" />
+                            <input type="hidden" name="tab" value="all-leads" />
+                            <strong><?php esc_html_e('Filter Standard Tags:', 'angie-snippets'); ?></strong>
+                            <?php if (empty($custom_tag_options)) : ?>
+                                <span style="color:#8c8f94; font-size:12px;"><?php esc_html_e('No standard tags created yet.', 'angie-snippets'); ?></span>
+                            <?php else : ?>
+                                <?php foreach ($custom_tag_options as $ct_opt) : ?>
+                                    <label class="emt-badge emt-badge-warning" style="cursor:pointer; gap:4px;">
+                                        <input type="checkbox" name="filter_custom_tag[]" value="<?php echo esc_attr($ct_opt); ?>" <?php checked(in_array($ct_opt, $filter_custom_tag)); ?> style="margin:0;" />
+                                        <?php echo esc_html($ct_opt); ?>
                                     </label>
                                 <?php endforeach; ?>
                                 <input type="submit" class="button button-small" value="<?php esc_attr_e('Apply', 'angie-snippets'); ?>" />
@@ -2402,10 +2436,16 @@ class Email_Marketing_Tracker_643272e1 {
                                             $camp_errors = intval($camp->error_count);
                                             $camp_remaining = max(0, $camp_total - intval($camp->sent_offset));
                                             $camp_pct = $camp_total > 0 ? round((intval($camp->sent_offset) / $camp_total) * 100) : 0;
+                                            $camp_slot = intval($camp->slot_size) > 0 ? intval($camp->slot_size) : $camp_total;
+                                            $camp_total_batches = ($camp_slot > 0 && $camp_total > 0) ? ceil($camp_total / $camp_slot) : ($camp_total > 0 ? 1 : 0);
+                                            $camp_current_batch = ($camp_slot > 0 && $camp_total_batches > 0) ? min($camp_total_batches, floor(intval($camp->sent_offset) / $camp_slot) + ($camp->status === 'sent' ? 0 : 1)) : 0;
                                             ?>
                                             <?php if ($camp_total > 0) : ?>
                                                 <small style="display:block;"><?php printf(esc_html__('%d / %d sent (%d%%)', 'angie-snippets'), $camp_sent_ok, $camp_total, $camp_pct); ?></small>
                                                 <small style="display:block; color:#646970;"><?php printf(esc_html__('%d remaining, %d errors', 'angie-snippets'), $camp_remaining, $camp_errors); ?></small>
+                                                <?php if ($camp_total_batches > 0) : ?>
+                                                    <small style="display:block; color:#646970;"><?php printf(esc_html__('Lot %d / %d', 'angie-snippets'), $camp_current_batch, $camp_total_batches); ?></small>
+                                                <?php endif; ?>
                                                 <?php if (!empty($camp->next_batch_at) && $camp->status === 'sending') : ?>
                                                     <small style="display:block; color:#2271b1;">⏱ <?php printf(esc_html__('Next batch: %s', 'angie-snippets'), esc_html($camp->next_batch_at)); ?></small>
                                                 <?php endif; ?>
