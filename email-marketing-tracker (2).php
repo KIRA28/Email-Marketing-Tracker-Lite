@@ -12,7 +12,7 @@ if (!defined('ABSPATH')) {
 }
 
 if (!defined('EMT_ASSETS_VERSION_643272e1')) {
-    define('EMT_ASSETS_VERSION_643272e1', '2.0.0');
+    define('EMT_ASSETS_VERSION_643272e1', '2.1.0');
 }
 
 class Email_Marketing_Tracker_643272e1 {
@@ -60,6 +60,7 @@ class Email_Marketing_Tracker_643272e1 {
 
         add_action('emt_cron_batch_send_643272e1', array($this, 'cron_process_batches'));
         add_action('wp_ajax_emt_calc_target_count_643272e1', array($this, 'ajax_calc_target_count'));
+        add_action('wp_ajax_emt_get_campaigns_status_643272e1', array($this, 'ajax_get_campaigns_status'));
     }
 
     // ================================================================
@@ -136,6 +137,7 @@ class Email_Marketing_Tracker_643272e1 {
             batch_interval_minutes int DEFAULT 60,
             next_batch_at datetime DEFAULT NULL,
             last_batch_at datetime DEFAULT NULL,
+            started_at datetime DEFAULT NULL,
             total_target_count int DEFAULT 0,
             sent_success_count int DEFAULT 0,
             error_count int DEFAULT 0,
@@ -213,6 +215,7 @@ class Email_Marketing_Tracker_643272e1 {
         $wpdb->query("ALTER TABLE {$this->campaigns_table} ADD COLUMN IF NOT EXISTS batch_interval_minutes int DEFAULT 60");
         $wpdb->query("ALTER TABLE {$this->campaigns_table} ADD COLUMN IF NOT EXISTS next_batch_at datetime DEFAULT NULL");
         $wpdb->query("ALTER TABLE {$this->campaigns_table} ADD COLUMN IF NOT EXISTS last_batch_at datetime DEFAULT NULL");
+        $wpdb->query("ALTER TABLE {$this->campaigns_table} ADD COLUMN IF NOT EXISTS started_at datetime DEFAULT NULL");
         $wpdb->query("ALTER TABLE {$this->campaigns_table} ADD COLUMN IF NOT EXISTS total_target_count int DEFAULT 0");
         $wpdb->query("ALTER TABLE {$this->campaigns_table} ADD COLUMN IF NOT EXISTS sent_success_count int DEFAULT 0");
         $wpdb->query("ALTER TABLE {$this->campaigns_table} ADD COLUMN IF NOT EXISTS error_count int DEFAULT 0");
@@ -310,6 +313,44 @@ class Email_Marketing_Tracker_643272e1 {
             );
         }
 
+        wp_enqueue_script('jquery');
+        wp_add_inline_script('jquery-core', "
+            (function() {
+                function emtSnakeifyTimelines() {
+                    document.querySelectorAll('.emt-timeline').forEach(function(container) {
+                        var items = Array.prototype.slice.call(container.children).filter(function(el) {
+                            return el.classList && el.classList.contains('emt-timeline-item');
+                        });
+                        if (!items.length) return;
+                        var rows = [];
+                        items.forEach(function(item) {
+                            var top = item.offsetTop;
+                            var row = rows.filter(function(r) { return Math.abs(r.top - top) < 5; })[0];
+                            if (!row) { row = { top: top, items: [] }; rows.push(row); }
+                            row.items.push(item);
+                        });
+                        rows.forEach(function(row, idx) {
+                            if (idx % 2 === 1) {
+                                row.items.forEach(function(item) { item.classList.add('emt-row-reverse'); });
+                                var anchor = row.items[0];
+                                row.items.slice().reverse().forEach(function(item) {
+                                    container.insertBefore(item, anchor);
+                                });
+                            }
+                        });
+                    });
+                }
+                document.addEventListener('DOMContentLoaded', function() {
+                    emtSnakeifyTimelines();
+                    setTimeout(emtSnakeifyTimelines, 300);
+                    window.addEventListener('resize', function() {
+                        clearTimeout(window.__emtSnakeResizeTimer);
+                        window.__emtSnakeResizeTimer = setTimeout(emtSnakeifyTimelines, 250);
+                    });
+                });
+            })();
+        ", 'after');
+
         wp_register_style('emt-admin-style-643272e1', false);
         wp_enqueue_style('emt-admin-style-643272e1');
         wp_add_inline_style('emt-admin-style-643272e1', "
@@ -333,9 +374,12 @@ class Email_Marketing_Tracker_643272e1 {
             .emt-badge-success { background: #f6ffed; color: #52c41a; }
             .emt-badge-warning { background: #fffbe6; color: #faad14; }
             .emt-badge-error { background: #fff2f0; color: #ff4d4f; }
-            .emt-timeline { position: relative; padding-left: 24px; margin-left: 10px; border-left: 2px solid #f0f0f1; }
-            .emt-timeline-item { position: relative; margin-bottom: 20px; }
-            .emt-timeline-item::before { content: ''; position: absolute; left: -31px; top: 4px; width: 12px; height: 12px; border-radius: 50%; background: #2271b1; border: 2px solid #fff; }
+            .emt-timeline { position: relative; display: flex; flex-wrap: wrap; align-items: flex-start; padding-left: 0; margin-left: 0; border-left: none; }
+            .emt-timeline-item { position: relative; width: 200px; margin: 0 34px 28px 0; padding-left: 0; padding-top: 18px; }
+            .emt-timeline-item::before { content: ''; position: absolute; left: 0; top: 0; width: 12px; height: 12px; border-radius: 50%; background: #2271b1; border: 2px solid #fff; box-shadow: 0 0 0 1px #e2e2e2; }
+            .emt-timeline-item::after { content: '→'; position: absolute; top: -3px; right: -26px; font-size: 20px; line-height: 1; color: #c3cad9; }
+            .emt-timeline-item.emt-row-reverse::after { content: '←'; left: -26px; right: auto; }
+            .emt-timeline-item:last-child::after { content: ''; }
             .emt-timeline-item.open::before { background: #faad14; }
             .emt-timeline-item.click::before { background: #1890ff; }
             .emt-timeline-item.visit::before { background: #722ed1; }
@@ -651,6 +695,50 @@ class Email_Marketing_Tracker_643272e1 {
         $where = $this->build_campaign_where_clause($fake_campaign);
         $count = intval($wpdb->get_var("SELECT COUNT(*) FROM {$this->leads_table} {$where}"));
         wp_send_json_success(array('count' => $count));
+    }
+
+    /**
+     * Live campaign supervision data, polled via AJAX (no page reload).
+     */
+    public function ajax_get_campaigns_status() {
+        if (!current_user_can('manage_options') || !check_ajax_referer('emt_admin_nonce', 'nonce', false)) {
+            wp_send_json_error(array('message' => __('Not allowed.', 'angie-snippets')));
+        }
+        global $wpdb;
+        $campaigns = $wpdb->get_results("SELECT * FROM {$this->campaigns_table} WHERE status != 'draft' ORDER BY id DESC LIMIT 30");
+        $out = array();
+        foreach ($campaigns as $camp) {
+            $total = intval($camp->total_target_count);
+            $pct = $total > 0 ? round((intval($camp->sent_offset) / $total) * 100) : 0;
+            $slot = intval($camp->slot_size) > 0 ? intval($camp->slot_size) : $total;
+            $total_batches = ($slot > 0 && $total > 0) ? (int) ceil($total / $slot) : 0;
+            $current_batch = ($slot > 0 && $total_batches > 0) ? min($total_batches, (int) floor(intval($camp->sent_offset) / $slot) + ($camp->status === 'sent' ? 0 : 1)) : 0;
+            $remaining = max(0, $total - intval($camp->sent_offset));
+            $eta = '';
+            if ($camp->status === 'sending' && $total_batches > 0 && $current_batch > 0) {
+                $batches_left = max(0, $total_batches - $current_batch);
+                $interval_min = intval($camp->batch_interval_minutes) > 0 ? intval($camp->batch_interval_minutes) : 60;
+                $eta = date('Y-m-d H:i:s', time() + ($batches_left * $interval_min * 60));
+            }
+            $out[] = array(
+                'id' => intval($camp->id),
+                'name' => $camp->name,
+                'status' => $camp->status,
+                'total' => $total,
+                'sent' => intval($camp->sent_success_count),
+                'remaining' => $remaining,
+                'errors' => intval($camp->error_count),
+                'percent' => $pct,
+                'slot_size' => $slot,
+                'interval_minutes' => intval($camp->batch_interval_minutes),
+                'started_at' => $camp->started_at,
+                'eta' => $eta,
+                'next_batch_at' => $camp->next_batch_at,
+                'current_batch' => $current_batch,
+                'total_batches' => $total_batches,
+            );
+        }
+        wp_send_json_success(array('campaigns' => $out));
     }
 
     private function build_campaign_where_clause($campaign) {
@@ -1202,19 +1290,46 @@ class Email_Marketing_Tracker_643272e1 {
                 exit;
             }
 
-            if ($action === 'send_campaign') {
+            if ($action === 'send_campaign' || $action === 'start_campaign' || $action === 'resume_campaign') {
                 check_admin_referer('emt_send_campaign_' . $id);
                 $camp_for_send = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$this->campaigns_table} WHERE id = %d", $id));
                 if ($camp_for_send) {
                     $where_for_send = $this->build_campaign_where_clause($camp_for_send);
                     $total_for_send = intval($wpdb->get_var("SELECT COUNT(*) FROM {$this->leads_table} {$where_for_send}"));
-                    $wpdb->update($this->campaigns_table, array('total_target_count' => $total_for_send), array('id' => $id));
+                    $update_data = array(
+                        'status' => 'sending',
+                        'total_target_count' => $total_for_send,
+                        'next_batch_at' => current_time('mysql'),
+                    );
+                    if (empty($camp_for_send->started_at)) {
+                        $update_data['started_at'] = current_time('mysql');
+                    }
+                    $wpdb->update($this->campaigns_table, $update_data, array('id' => $id));
+                    $this->log_campaign_history($id, 'Queued', __('Campaign registered — background cron will process it in batches. This page did not wait for sending to finish.', 'angie-snippets'));
                 }
-                $result = $this->process_campaign_sending($id);
-                $sent = is_array($result) ? $result['sent'] : intval($result);
-                $wpdb->update($this->campaigns_table, array('status' => 'sent'), array('id' => $id));
-                $this->log_campaign_history($id, 'Campaign Completed', sprintf(__('Manual send: %d sent, %d errors.', 'angie-snippets'), $sent, is_array($result) ? $result['errors'] : 0));
-                wp_redirect(admin_url('admin.php?page=emt-campaigns&message=3&sent=' . $sent));
+                // Nudge WP-Cron to fire right away instead of waiting for natural
+                // traffic. This is a fire-and-forget, non-blocking HTTP call —
+                // it does NOT wait for the sending to complete.
+                if (function_exists('spawn_cron')) {
+                    spawn_cron();
+                }
+                wp_redirect(admin_url('admin.php?page=emt-campaigns&message=5'));
+                exit;
+            }
+
+            if ($action === 'pause_campaign') {
+                check_admin_referer('emt_pause_campaign_' . $id);
+                $wpdb->update($this->campaigns_table, array('status' => 'paused'), array('id' => $id));
+                $this->log_campaign_history($id, 'Paused', __('Campaign paused by user.', 'angie-snippets'));
+                wp_redirect(admin_url('admin.php?page=emt-campaigns&message=6'));
+                exit;
+            }
+
+            if ($action === 'stop_campaign') {
+                check_admin_referer('emt_stop_campaign_' . $id);
+                $wpdb->update($this->campaigns_table, array('status' => 'stopped'), array('id' => $id));
+                $this->log_campaign_history($id, 'Stopped', __('Campaign stopped by user.', 'angie-snippets'));
+                wp_redirect(admin_url('admin.php?page=emt-campaigns&message=7'));
                 exit;
             }
         }
@@ -2294,10 +2409,83 @@ class Email_Marketing_Tracker_643272e1 {
                         if ($_GET['message'] == 2) esc_html_e('Campaign entry deleted.', 'angie-snippets'); 
                         if ($_GET['message'] == 3) printf(__('Campaign broadcast completed. Sent to %d subscribers.', 'angie-snippets'), intval($_GET['sent'])); 
                         if ($_GET['message'] == 4) esc_html_e('Sender settings saved.', 'angie-snippets'); 
+                        if ($_GET['message'] == 5) esc_html_e('Campaign queued — sending will continue in the background. You can safely leave this page.', 'angie-snippets'); 
+                        if ($_GET['message'] == 6) esc_html_e('Campaign paused.', 'angie-snippets'); 
+                        if ($_GET['message'] == 7) esc_html_e('Campaign stopped.', 'angie-snippets'); 
                         ?>
                     </p>
                 </div>
             <?php endif; ?>
+
+            <div class="emt-panel">
+                <h2 class="emt-panel-title">
+                    <span><?php esc_html_e('Supervision des campagnes (temps réel)', 'angie-snippets'); ?></span>
+                    <span class="emt-badge emt-badge-success" id="emt-sup-live-badge"><?php esc_html_e('Live', 'angie-snippets'); ?></span>
+                </h2>
+                <table class="emt-table" id="emt-supervision-table">
+                    <thead>
+                        <tr>
+                            <th><?php esc_html_e('Campagne', 'angie-snippets'); ?></th>
+                            <th><?php esc_html_e('Statut', 'angie-snippets'); ?></th>
+                            <th><?php esc_html_e('Progression', 'angie-snippets'); ?></th>
+                            <th><?php esc_html_e('Envoyés', 'angie-snippets'); ?></th>
+                            <th><?php esc_html_e('Restants', 'angie-snippets'); ?></th>
+                            <th><?php esc_html_e('Erreurs', 'angie-snippets'); ?></th>
+                            <th><?php esc_html_e('%', 'angie-snippets'); ?></th>
+                            <th><?php esc_html_e('Lot', 'angie-snippets'); ?></th>
+                            <th><?php esc_html_e('Intervalle', 'angie-snippets'); ?></th>
+                            <th><?php esc_html_e('Début', 'angie-snippets'); ?></th>
+                            <th><?php esc_html_e('Fin estimée', 'angie-snippets'); ?></th>
+                            <th><?php esc_html_e('Prochain lot', 'angie-snippets'); ?></th>
+                        </tr>
+                    </thead>
+                    <tbody id="emt-supervision-tbody">
+                        <tr><td colspan="12"><?php esc_html_e('Chargement…', 'angie-snippets'); ?></td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <script>
+            (function() {
+                var supNonce = '<?php echo esc_js(wp_create_nonce('emt_admin_nonce')); ?>';
+                function esc(s) { var d = document.createElement('div'); d.textContent = (s === null || s === undefined) ? '' : s; return d.innerHTML; }
+                function refreshSupervision() {
+                    var body = new URLSearchParams();
+                    body.append('action', 'emt_get_campaigns_status_643272e1');
+                    body.append('nonce', supNonce);
+                    fetch(ajaxurl, { method: 'POST', credentials: 'same-origin', body: body })
+                        .then(function(r) { return r.json(); })
+                        .then(function(res) {
+                            var tbody = document.getElementById('emt-supervision-tbody');
+                            if (!res || !res.success || !res.data.campaigns.length) {
+                                tbody.innerHTML = '<tr><td colspan="12"><?php echo esc_js(__('Aucune campagne active pour le moment.', 'angie-snippets')); ?></td></tr>';
+                                return;
+                            }
+                            var rows = res.data.campaigns.map(function(c) {
+                                return '<tr>' +
+                                    '<td><strong>' + esc(c.name) + '</strong></td>' +
+                                    '<td><span class="emt-badge emt-badge-info">' + esc(c.status) + '</span></td>' +
+                                    '<td>' + esc(c.current_batch) + ' / ' + esc(c.total_batches) + '</td>' +
+                                    '<td>' + esc(c.sent) + '</td>' +
+                                    '<td>' + esc(c.remaining) + '</td>' +
+                                    '<td>' + esc(c.errors) + '</td>' +
+                                    '<td>' + esc(c.percent) + '%</td>' +
+                                    '<td>' + esc(c.slot_size) + '</td>' +
+                                    '<td>' + esc(c.interval_minutes) + ' min</td>' +
+                                    '<td>' + esc(c.started_at || '—') + '</td>' +
+                                    '<td>' + esc(c.eta || '—') + '</td>' +
+                                    '<td>' + esc(c.next_batch_at || '—') + '</td>' +
+                                '</tr>';
+                            }).join('');
+                            tbody.innerHTML = rows;
+                        })
+                        .catch(function() {});
+                }
+                document.addEventListener('DOMContentLoaded', function() {
+                    refreshSupervision();
+                    setInterval(refreshSupervision, 5000);
+                });
+            })();
+            </script>
 
             <div class="emt-panel">
                 <h2 class="emt-panel-title"><?php esc_html_e('Sender Settings', 'angie-snippets'); ?></h2>
@@ -2457,8 +2645,16 @@ class Email_Marketing_Tracker_643272e1 {
                                         </td>
                                         <td><span class="emt-badge <?php echo esc_attr($status_badge); ?>"><?php echo esc_html($camp->status); ?></span></td>
                                         <td>
-                                            <?php if ($camp->status !== 'sent' && $camp->template_id > 0) : ?>
-                                                <a href="<?php echo esc_url(wp_nonce_url(admin_url('admin.php?page=emt-campaigns&action=send_campaign&id=' . $camp->id), 'emt_send_campaign_' . $camp->id)); ?>" class="button button-small button-primary" onclick="return confirm('<?php esc_attr_e('Are you sure you want to broadcast this campaign?', 'angie-snippets'); ?>')"><?php esc_html_e('Send/Resume', 'angie-snippets'); ?></a>
+                                            <?php if (in_array($camp->status, array('draft', 'scheduled')) && $camp->template_id > 0) : ?>
+                                                <a href="<?php echo esc_url(wp_nonce_url(admin_url('admin.php?page=emt-campaigns&action=start_campaign&id=' . $camp->id), 'emt_send_campaign_' . $camp->id)); ?>" class="button button-small button-primary" onclick="return confirm('<?php esc_attr_e('Start this campaign in the background?', 'angie-snippets'); ?>')"><?php esc_html_e('Démarrer', 'angie-snippets'); ?></a>
+                                            <?php endif; ?>
+                                            <?php if ($camp->status === 'sending') : ?>
+                                                <a href="<?php echo esc_url(wp_nonce_url(admin_url('admin.php?page=emt-campaigns&action=pause_campaign&id=' . $camp->id), 'emt_pause_campaign_' . $camp->id)); ?>" class="button button-small"><?php esc_html_e('Pause', 'angie-snippets'); ?></a>
+                                                <a href="<?php echo esc_url(wp_nonce_url(admin_url('admin.php?page=emt-campaigns&action=stop_campaign&id=' . $camp->id), 'emt_stop_campaign_' . $camp->id)); ?>" class="button button-small button-link-delete" onclick="return confirm('<?php esc_attr_e('Stop this campaign permanently?', 'angie-snippets'); ?>')"><?php esc_html_e('Arrêter', 'angie-snippets'); ?></a>
+                                            <?php endif; ?>
+                                            <?php if ($camp->status === 'paused') : ?>
+                                                <a href="<?php echo esc_url(wp_nonce_url(admin_url('admin.php?page=emt-campaigns&action=resume_campaign&id=' . $camp->id), 'emt_send_campaign_' . $camp->id)); ?>" class="button button-small button-primary"><?php esc_html_e('Reprendre', 'angie-snippets'); ?></a>
+                                                <a href="<?php echo esc_url(wp_nonce_url(admin_url('admin.php?page=emt-campaigns&action=stop_campaign&id=' . $camp->id), 'emt_stop_campaign_' . $camp->id)); ?>" class="button button-small button-link-delete" onclick="return confirm('<?php esc_attr_e('Stop this campaign permanently?', 'angie-snippets'); ?>')"><?php esc_html_e('Arrêter', 'angie-snippets'); ?></a>
                                             <?php endif; ?>
                                             <a href="<?php echo esc_url(admin_url('admin.php?page=emt-campaigns&edit=' . $camp->id)); ?>" class="button button-small"><?php esc_html_e('Edit', 'angie-snippets'); ?></a>
                                             <a href="<?php echo esc_url(wp_nonce_url(admin_url('admin.php?page=emt-campaigns&action=delete_campaign&id=' . $camp->id), 'emt_delete_campaign_' . $camp->id)); ?>" class="button button-small button-link-delete" onclick="return confirm('<?php esc_attr_e('Delete campaign?', 'angie-snippets'); ?>')"><?php esc_html_e('Delete', 'angie-snippets'); ?></a>
